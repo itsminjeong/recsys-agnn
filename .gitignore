@@ -103,3 +103,8 @@ results/
 # data (원본/가공 데이터는 보통 제외)
 data/ml-100k/
 data/processed/*.csv
+
+# large artifacts
+splits/
+results/
+data/
