@@ -1,12 +1,15 @@
 # run_ts_itemcold.py
 # ------------------------------------------------------------
 # Teacher–Student for item-cold:
-#  - Teacher: LightGCN 학습 -> (h_user, h_item) 저장
+#  - Teacher: (LightGCN/MF/GCN) 학습 -> (h_user, h_item) 저장
 #  - Student: item content(genre one-hot) -> teacher h_item 회귀
 #  - Eval: cold item embedding을 student 예측으로 교체 후 Recall/NDCG 측정
+#
+# + Uncertainty-aware weighting (MC Dropout)
+#   - Teacher에서 MC Dropout으로 item embedding sigma 추정
+#   - Student distillation loss에 exp(-alpha*sigma) weight 적용
 # ------------------------------------------------------------
 
-# run_ts_itemcold.py
 import argparse, os
 from pathlib import Path
 
@@ -144,16 +147,14 @@ def build_lightgcn_norm_adj(
 
 # ============================================================
 # Teacher models
-#   - LightGCN: 기존 유지
-#   - MFTeacher: dot-product MF (graph X)
-#   - GCNTeacher: LightGCN 그래프 + (Linear + ReLU + Dropout)
 # ============================================================
 
 # -----------------------------
 # LightGCN (teacher)
+# CHANGED: MC Dropout 지원을 위해 embedding dropout 추가
 # -----------------------------
 class LightGCN(nn.Module):
-    def __init__(self, U_size, I_size, dim, layers, A_norm_sparse):
+    def __init__(self, U_size, I_size, dim, layers, A_norm_sparse, emb_dropout=0.0):
         super().__init__()
         self.U = U_size
         self.I = I_size
@@ -166,15 +167,24 @@ class LightGCN(nn.Module):
         nn.init.normal_(self.user_emb.weight, std=0.01)
         nn.init.normal_(self.item_emb.weight, std=0.01)
 
-    def compute_embeddings(self):
+        self.emb_dropout = float(emb_dropout)
+        self.drop = nn.Dropout(self.emb_dropout)
+
+    def compute_embeddings(self, mc_dropout: bool = False):
         x0 = torch.zeros(self.U + self.I, self.dim, device=self.user_emb.weight.device)
         x0[:self.U] = self.user_emb.weight
         x0[self.U:] = self.item_emb.weight
+
+        # ADDED: MC Dropout용. (train 모드에서만 dropout 작동)
+        if mc_dropout and self.emb_dropout > 0:
+            x0 = self.drop(x0)
 
         xk = x0
         h = x0.clone()
         for _ in range(self.layers):
             xk = torch.sparse.mm(self.A, xk)
+            if mc_dropout and self.emb_dropout > 0:
+                xk = self.drop(xk)
             h = h + xk
         h = h / float(self.layers + 1)
 
@@ -187,14 +197,15 @@ class LightGCN(nn.Module):
         return (h_user[users] * h_item[items]).sum(dim=-1)
 
     def forward(self, users, items):
-        h_user, h_item = self.compute_embeddings()
+        h_user, h_item = self.compute_embeddings(mc_dropout=False)
         return self.score(h_user, h_item, users, items)
 
 # -----------------------------
-# MF (teacher) - dot-product only (bias/mu 제거)
+# MF (teacher)
+# CHANGED: MC Dropout용 embedding dropout 추가
 # -----------------------------
 class MFTeacher(nn.Module):
-    def __init__(self, U_size, I_size, dim):
+    def __init__(self, U_size, I_size, dim, emb_dropout=0.0):
         super().__init__()
         self.U = U_size
         self.I = I_size
@@ -205,19 +216,28 @@ class MFTeacher(nn.Module):
         nn.init.normal_(self.user_emb.weight, std=0.01)
         nn.init.normal_(self.item_emb.weight, std=0.01)
 
-    def compute_embeddings(self):
-        return self.user_emb.weight, self.item_emb.weight
+        self.emb_dropout = float(emb_dropout)
+        self.drop = nn.Dropout(self.emb_dropout)
+
+    def compute_embeddings(self, mc_dropout: bool = False):
+        hu = self.user_emb.weight
+        hi = self.item_emb.weight
+        if mc_dropout and self.emb_dropout > 0:
+            hu = self.drop(hu)
+            hi = self.drop(hi)
+        return hu, hi
 
     @staticmethod
     def score(h_user, h_item, users, items):
         return (h_user[users] * h_item[items]).sum(dim=-1)
 
     def forward(self, users, items):
-        h_user, h_item = self.compute_embeddings()
+        h_user, h_item = self.compute_embeddings(mc_dropout=False)
         return self.score(h_user, h_item, users, items)
 
 # -----------------------------
 # GCN (teacher) - bipartite graph + Linear/ReLU/Dropout
+# CHANGED: compute_embeddings에 mc_dropout 플래그 추가(동일 인터페이스)
 # -----------------------------
 class GCNTeacher(nn.Module):
     def __init__(self, U_size, I_size, dim, layers, A_norm_sparse, dropout=0.0):
@@ -241,7 +261,7 @@ class GCNTeacher(nn.Module):
         self.act = nn.ReLU()
         self.drop = nn.Dropout(self.dropout)
 
-    def compute_embeddings(self):
+    def compute_embeddings(self, mc_dropout: bool = False):
         x = torch.zeros(self.U + self.I, self.dim, device=self.user_emb.weight.device)
         x[:self.U] = self.user_emb.weight
         x[self.U:] = self.item_emb.weight
@@ -250,7 +270,8 @@ class GCNTeacher(nn.Module):
             x = torch.sparse.mm(self.A, x)
             x = self.W[li](x)
             x = self.act(x)
-            if self.dropout > 0:
+            # dropout은 mc_dropout일 때만 “의도적으로” 켬
+            if mc_dropout and self.dropout > 0:
                 x = self.drop(x)
 
         h_user = x[:self.U]
@@ -262,7 +283,7 @@ class GCNTeacher(nn.Module):
         return (h_user[users] * h_item[items]).sum(dim=-1)
 
     def forward(self, users, items):
-        h_user, h_item = self.compute_embeddings()
+        h_user, h_item = self.compute_embeddings(mc_dropout=False)
         return self.score(h_user, h_item, users, items)
 
 # -----------------------------
@@ -301,9 +322,9 @@ def _build_user_hist(df: pd.DataFrame):
 
 @torch.no_grad()
 def eval_sampled_recall_ndcg_at_k(
-    scorer,                 # callable(users_tensor, items_tensor) -> scores
-    train_df: pd.DataFrame, # negative 제외용
-    eval_df: pd.DataFrame,  # (user, positive item) rows
+    scorer,
+    train_df: pd.DataFrame,
+    eval_df: pd.DataFrame,
     n_items_plus1: int,
     K: int,
     n_neg: int = 99,
@@ -346,9 +367,60 @@ def eval_sampled_recall_ndcg_at_k(
 
     return float(np.mean(recalls)), float(np.mean(ndcgs))
 
-# -----------------------------
+# ============================================================
+# Uncertainty (MC Dropout) utilities
+# ============================================================
+@torch.no_grad()
+def estimate_item_uncertainty_mc_dropout(teacher, T: int, device: str):
+    """
+    teacher.compute_embeddings(mc_dropout=True) 를 T번 호출해서 item embedding sigma 추정.
+    sigma는 per-item scalar로 반환 (embedding norm의 std).
+    return:
+      h_user_mu: [U, dim]
+      h_item_mu: [I, dim]
+      sigma_item: [I]  (float32)
+    """
+    # MC Dropout을 켜려면 teacher를 train 모드로 두되, gradient는 no_grad로 막는다.
+    teacher.train()
+
+    h_user_list = []
+    h_item_list = []
+    for _ in range(T):
+        hu, hi = teacher.compute_embeddings(mc_dropout=True)
+        h_user_list.append(hu.unsqueeze(0))
+        h_item_list.append(hi.unsqueeze(0))
+
+    H_u = torch.cat(h_user_list, dim=0)  # [T, U, dim]
+    H_i = torch.cat(h_item_list, dim=0)  # [T, I, dim]
+
+    h_user_mu = H_u.mean(dim=0)
+    h_item_mu = H_i.mean(dim=0)
+
+    # per-item scalar sigma: embedding norm std
+    norms = torch.norm(H_i, dim=-1)      # [T, I]
+    sigma_item = norms.std(dim=0)        # [I]
+
+    # sigma 정규화(0~1)로 안정화
+    smin = sigma_item.min()
+    smax = sigma_item.max()
+    sigma_norm = (sigma_item - smin) / (smax - smin + 1e-12)
+
+    # 다시 eval로 복구 (안전)
+    teacher.eval()
+
+    return h_user_mu.detach(), h_item_mu.detach(), sigma_norm.detach()
+
+def compute_weights_from_sigma(sigma_norm: torch.Tensor, alpha: float):
+    """
+    sigma_norm: [I] in [0,1]
+    return w: [I]
+    """
+    w = torch.exp(-float(alpha) * sigma_norm)
+    return w
+
+# ============================================================
 # Main
-# -----------------------------
+# ============================================================
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", choices=["teacher", "student", "eval", "all"], default="all")
@@ -358,18 +430,20 @@ def main():
     ap.add_argument("--teacher_out", default="results/teacher_emb.pt")
     ap.add_argument("--student_out", default="results/student_mlp.pt")
 
-    # teacher model 선택
     ap.add_argument("--teacher_model", choices=["lightgcn", "mf", "gcn"], default="lightgcn")
 
     # teacher common
     ap.add_argument("--dim", type=int, default=64)
-    ap.add_argument("--layers", type=int, default=2)          # LightGCN/GCN layers
+    ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--bs", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-3)
 
     # gcn extra
     ap.add_argument("--gcn_dropout", type=float, default=0.0)
+
+    # ADDED: LightGCN/MF embedding dropout (MC Dropout용)
+    ap.add_argument("--mc_dropout", type=float, default=0.0)
 
     # graph options (LightGCN/GCN에서만 사용)
     ap.add_argument("--use_item_item", choices=["OFF", "ON"], default="ON")
@@ -384,13 +458,18 @@ def main():
     ap.add_argument("--student_depth", type=int, default=3)
     ap.add_argument("--student_dropout", type=float, default=0.1)
 
+    # ADDED: Uncertainty-aware weighting on student loss
+    ap.add_argument("--uncertainty", choices=["OFF", "ON"], default="OFF")
+    ap.add_argument("--mc_T", type=int, default=8)
+    ap.add_argument("--alpha", type=float, default=2.0)
+
     # eval K
     ap.add_argument("--eval_k_warm", type=int, default=10)
     ap.add_argument("--eval_k_cold", type=int, default=100)
 
     # eval protocol
     ap.add_argument("--eval_protocol", choices=["full", "sampled"], default="full")
-    ap.add_argument("--eval_neg_samples", type=int, default=99)  # sampled일 때만 사용
+    ap.add_argument("--eval_neg_samples", type=int, default=99)
     ap.add_argument("--eval_seed", type=int, default=2025)
 
     args = ap.parse_args()
@@ -410,9 +489,6 @@ def main():
     if args.stage in ["teacher", "all"]:
         teacher_model = args.teacher_model
 
-        # -----------------------------
-        # build teacher model
-        # -----------------------------
         if teacher_model in ["lightgcn", "gcn"]:
             use_item_item = (args.use_item_item == "ON")
             ii_edges, ii_sims = (None, None)
@@ -428,7 +504,10 @@ def main():
             )
 
             if teacher_model == "lightgcn":
-                teacher = LightGCN(U_size, I_size, args.dim, args.layers, A_norm).to(device)
+                teacher = LightGCN(
+                    U_size, I_size, args.dim, args.layers, A_norm,
+                    emb_dropout=args.mc_dropout
+                ).to(device)
             else:
                 teacher = GCNTeacher(
                     U_size, I_size, args.dim, args.layers, A_norm,
@@ -438,7 +517,7 @@ def main():
         elif teacher_model == "mf":
             U_size = int(n_users) + 1
             I_size = int(n_items) + 1
-            teacher = MFTeacher(U_size, I_size, args.dim).to(device)
+            teacher = MFTeacher(U_size, I_size, args.dim, emb_dropout=args.mc_dropout).to(device)
 
         else:
             raise RuntimeError(f"Unknown teacher_model={teacher_model}")
@@ -453,20 +532,12 @@ def main():
         best_rmse = 1e9
         best_state = None
 
-        # -----------------------------
-        # train teacher
-        # -----------------------------
         for ep in range(1, args.epochs + 1):
             teacher.train()
-
             for u, i, r in tr_loader:
                 u, i, r = u.to(device), i.to(device), r.to(device)
 
-                # ✅ IMPORTANT:
-                # LightGCN/GCN은 compute_embeddings()의 결과(autograd graph)를
-                # 여러 batch에서 재사용하면 "backward twice" 에러가 나므로
-                # batch마다 fresh embeddings를 다시 계산한다.
-                h_user_b, h_item_b = teacher.compute_embeddings()
+                h_user_b, h_item_b = teacher.compute_embeddings(mc_dropout=False)
                 pred = teacher.score(h_user_b, h_item_b, u, i)
 
                 loss = loss_fn(pred, r)
@@ -488,39 +559,59 @@ def main():
                 best_rmse = vrmse
                 best_state = {k: v.detach().cpu() for k, v in teacher.state_dict().items()}
 
-        # -----------------------------
-        # load best + save embeddings
-        # -----------------------------
         if best_state is not None:
             teacher.load_state_dict(best_state)
 
         teacher.eval()
         with torch.no_grad():
-            h_user, h_item = teacher.compute_embeddings()
+            h_user_det, h_item_det = teacher.compute_embeddings(mc_dropout=False)
+
+        # ADDED: uncertainty 계산 (MC Dropout)
+        h_user_save = h_user_det
+        h_item_save = h_item_det
+        sigma_item = None
+
+        if args.uncertainty == "ON":
+            if args.mc_dropout <= 0 and teacher_model in ["lightgcn", "mf"]:
+                print("[WARN] uncertainty=ON인데 mc_dropout=0.0 입니다. dropout을 0.1~0.2로 설정 추천.")
+            hu_mu, hi_mu, sigma_norm = estimate_item_uncertainty_mc_dropout(
+                teacher, T=args.mc_T, device=device
+            )
+            # teacher_out에는 평균 임베딩을 저장(불확실성용)
+            h_user_save = hu_mu.cpu()
+            h_item_save = hi_mu.cpu()
+            sigma_item = sigma_norm.cpu()
+            print(f"[UNC] MC Dropout done. T={args.mc_T}, sigma_norm range="
+                  f"{sigma_item.min().item():.4f}~{sigma_item.max().item():.4f}")
 
         os.makedirs(Path(args.teacher_out).parent, exist_ok=True)
-        torch.save({
-            "teacher_model": teacher_model,  # optional meta
-            "h_user": h_user.detach().cpu(),
-            "h_item": h_item.detach().cpu(),
+        save_dict = {
+            "teacher_model": teacher_model,
+            "h_user": h_user_save.detach().cpu(),
+            "h_item": h_item_save.detach().cpu(),
             "n_users": n_users,
             "n_items": n_items,
-            "U_size": int(h_user.shape[0]),
-            "I_size": int(h_item.shape[0]),
+            "U_size": int(h_user_save.shape[0]),
+            "I_size": int(h_item_save.shape[0]),
             "dim": args.dim,
             "layers": args.layers,
             "use_item_item": args.use_item_item,
             "ii_strength": args.ii_strength,
             "gcn_dropout": args.gcn_dropout,
-        }, args.teacher_out)
+            "mc_dropout": args.mc_dropout,
+            "uncertainty": args.uncertainty,
+            "mc_T": args.mc_T,
+            "alpha": args.alpha,
+        }
+        if sigma_item is not None:
+            save_dict["sigma_item"] = sigma_item  # [I_size] in [0,1]
+        torch.save(save_dict, args.teacher_out)
         print(f"[SAVE] teacher embeddings -> {args.teacher_out}")
 
-        # -----------------------------
         # teacher metrics
-        # -----------------------------
         cold_rmse, cold_mae = eval_rmse_mae(teacher, te_loader, device)
 
-        scorer_t = make_scorer(h_user, h_item)
+        scorer_t = make_scorer(h_user_det, h_item_det)  # score는 deterministic 기준(학습 모델 자체)
         if args.eval_protocol == "sampled":
             cold_recallK, cold_ndcgK = eval_sampled_recall_ndcg_at_k(
                 scorer_t, tr, te, n_items + 1,
@@ -553,17 +644,33 @@ def main():
         dim = h_item_teacher.shape[1]
         n_items_ckpt = int(ckpt["n_items"])
 
+        # ADDED: sigma 로드(없으면 None)
+        sigma_item = ckpt.get("sigma_item", None)  # [I_size] in [0,1] or None
+        if args.uncertainty == "ON" and sigma_item is None:
+            print("[WARN] uncertainty=ON인데 teacher_out에 sigma_item이 없습니다. teacher stage를 uncertainty=ON으로 다시 저장하세요.")
+
         feat_np, D = load_item_genre_features(args.items_csv, n_items_ckpt)
         feat = torch.from_numpy(feat_np).float()
 
-        # warm items only
         warm_items = sorted(set(tr["item_id"].astype(int).unique().tolist()))
         warm_items = [it for it in warm_items if 1 <= it <= n_items_ckpt]
 
         X = feat[warm_items]             # [W, D]
-        Y = h_item_teacher[warm_items]   # [W, dim]  <-- RAW 회귀 (normalize 금지)
+        Y = h_item_teacher[warm_items]   # [W, dim]
 
-        ds = torch.utils.data.TensorDataset(X, Y)
+        # ADDED: warm item별 weight
+        Ww = None
+        if args.uncertainty == "ON" and sigma_item is not None:
+            w_all = compute_weights_from_sigma(sigma_item.float(), alpha=args.alpha)  # [I]
+            Ww = w_all[warm_items].float()  # [W]
+            # 안전장치: 너무 작아지는 weight 방지(선택)
+            Ww = torch.clamp(Ww, min=0.1, max=1.0)
+
+        if Ww is None:
+            ds = torch.utils.data.TensorDataset(X, Y)
+        else:
+            ds = torch.utils.data.TensorDataset(X, Y, Ww)
+
         dl = DataLoader(ds, batch_size=args.student_bs, shuffle=True)
 
         student = ContentMLP(
@@ -578,10 +685,24 @@ def main():
         for ep in range(1, args.student_epochs + 1):
             student.train()
             losses = []
-            for xb, yb in dl:
+
+            for batch in dl:
+                if Ww is None:
+                    xb, yb = batch
+                    wb = None
+                else:
+                    xb, yb, wb = batch
+
                 xb, yb = xb.to(device), yb.to(device)
-                pred = student(xb)  # normalize 금지
-                loss = torch.mean((pred - yb) ** 2)
+                pred = student(xb)
+
+                # CHANGED: uncertainty=ON이면 weighted MSE
+                if wb is None:
+                    loss = torch.mean((pred - yb) ** 2)
+                else:
+                    wb = wb.to(device)  # [B]
+                    mse_per = ((pred - yb) ** 2).mean(dim=1)  # [B]
+                    loss = (wb * mse_per).mean()
 
                 opt.zero_grad()
                 loss.backward()
@@ -599,6 +720,8 @@ def main():
             "hidden": args.student_hidden,
             "depth": args.student_depth,
             "dropout": args.student_dropout,
+            "uncertainty": args.uncertainty,
+            "alpha": args.alpha,
         }, args.student_out)
         print(f"[SAVE] student model -> {args.student_out}")
 
@@ -629,7 +752,6 @@ def main():
         te_items_set = set(te["item_id"].astype(int).unique().tolist())
         cold_items = sorted(list(te_items_set - tr_items_set))
 
-        # ✅ DIAG: norm sanity check
         with torch.no_grad():
             warm_items = sorted([it for it in tr_items_set if 1 <= it <= n_items_ckpt])
 
@@ -644,7 +766,6 @@ def main():
             user_norm = h_user[1:].norm(dim=1)
             print("[NORM] user norm mean/std:", user_norm.mean().item(), user_norm.std().item())
 
-        # 교체: RAW로 고정
         h_item_final = h_item.clone()
         with torch.no_grad():
             xi = feat[cold_items]

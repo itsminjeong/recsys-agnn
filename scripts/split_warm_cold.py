@@ -11,16 +11,16 @@ def strict_cold_split(ratings, cold_user_ratio=0.1, cold_item_ratio=0.0, valid_r
 
     n_cu = int(len(users) * cold_user_ratio)
     n_ci = int(len(items) * cold_item_ratio)
-    cold_users = set(rng.choice(users, n_cu, replace=False)) if n_cu>0 else set()
-    cold_items = set(rng.choice(items, n_ci, replace=False)) if n_ci>0 else set()
+    cold_users = set(rng.choice(users, n_cu, replace=False)) if n_cu > 0 else set()
+    cold_items = set(rng.choice(items, n_ci, replace=False)) if n_ci > 0 else set()
 
-    # cold user/item은 학습셋에서 제거하고 test_cold로 이동
-    test_cold = pd.concat([
-        ratings[ratings.user_id.isin(cold_users)],
-        ratings[ratings.item_id.isin(cold_items)]
-    ]).drop_duplicates().reset_index(drop=True)
+    # ✅ 핵심: cold row 마스크로 분리
+    is_cold = ratings["user_id"].isin(cold_users) | ratings["item_id"].isin(cold_items)
 
-    remain = ratings.drop(index=test_cold.index).reset_index(drop=True)
+    test_cold = ratings[is_cold].copy().reset_index(drop=True)
+    remain = ratings[~is_cold].copy().reset_index(drop=True)
+
+    # valid는 remain에서 샘플링
     valid = remain.sample(frac=valid_ratio, random_state=seed)
     train = remain.drop(valid.index).reset_index(drop=True)
     valid = valid.reset_index(drop=True)
